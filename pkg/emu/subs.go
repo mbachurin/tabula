@@ -382,25 +382,125 @@ func expandStars(pattern string, n int32) string {
 }
 
 // batchSubscribe handles "/batchsubscribe ,ssiii <alias> /meters/N <a> <b> <tf>".
+
 func (s *Server) batchSubscribe(m osc.Message, c *Client) error {
-	if len(m.Args) != 5 || m.Args[0].Tag != 's' || m.Args[1].Tag != 's' {
-		return fmt.Errorf("expects ,ssiii")
-	}
-	ints, ok := intArgs(m.Args[2:])
-	if !ok {
-		return fmt.Errorf("expects ,ssiii")
-	}
-	alias := m.Args[0].Str
-	id, err := meterID(m.Args[1].Str)
-	if err != nil {
-		return err
-	}
-	params := ints[:meterArgCount[id]]
-	now := time.Now()
-	return s.subs.add(&subscription{
-		client: c, name: alias, kind: "batchsubscribe", interval: interval(ints[2]), expires: now.Add(subLease), next: now,
-		produce: func(t *tick) (osc.Message, bool) {
-			return osc.NewMessage(alias, osc.Blob(meterBlob(s.meterValues(id, params, t.levels(), t.now)))), true
-		},
-	})
+    if len(m.Args) < 5 {
+        return fmt.Errorf("batchsubscribe: too few arguments")
+    }
+
+    // Last three arguments: start, end, time factor.
+    ints, ok := intArgs(m.Args[len(m.Args)-3:])
+    if !ok {
+        return fmt.Errorf("batchsubscribe: last three arguments must be ints")
+    }
+
+    strArgs := m.Args[:len(m.Args)-3]
+    if len(strArgs) < 2 {
+        return fmt.Errorf("batchsubscribe: missing alias or paths")
+    }
+
+    for _, a := range strArgs {
+        if a.Tag != 's' {
+            return fmt.Errorf("batchsubscribe: expected string arguments")
+        }
+    }
+
+    alias := strArgs[0].Str
+
+    // Preserve existing meter subscriptions.
+    if len(strArgs) == 2 &&
+        strings.HasPrefix(strArgs[1].Str, "/meters/") {
+
+        id, err := meterID(strArgs[1].Str)
+        if err != nil {
+            return err
+        }
+
+        params := ints[:meterArgCount[id]]
+        now := time.Now()
+
+        return s.subs.add(&subscription{
+            client: c,
+            name: alias,
+            kind: "batchsubscribe",
+            interval: interval(ints[2]),
+            expires: now.Add(subLease),
+            next: now,
+            produce: func(t *tick) (osc.Message, bool) {
+                return osc.NewMessage(
+                    alias,
+                    osc.Blob(meterBlob(
+                        s.meterValues(id, params, t.levels(), t.now),
+                    )),
+                ), true
+            },
+        })
+    }
+
+    // Parameter subscriptions: initial support for CH 01-32.
+    lo, hi := int64(ints[0]), int64(ints[1])
+    if lo < 0 || hi < lo || hi >= 32 {
+        return fmt.Errorf(
+            "batchsubscribe: unsupported channel range %d-%d",
+            lo, hi,
+        )
+    }
+
+    var addrs []string
+
+    for n := lo; n <= hi; n++ {
+        for _, arg := range strArgs[1:] {
+            path := fmt.Sprintf("/ch/%02d%s", n+1, arg.Str)
+
+            if s.store.Schema().Leaf(path) == nil {
+                return fmt.Errorf("unknown parameter %s", path)
+            }
+
+            if len(addrs) >= maxFormatParams {
+                return fmt.Errorf("too many batch parameters")
+            }
+
+            addrs = append(addrs, path)
+        }
+    }
+
+    now := time.Now()
+
+    return s.subs.add(&subscription{
+        client: c,
+        name: alias,
+        kind: "batchsubscribe",
+        interval: interval(ints[2]),
+        expires: now.Add(subLease),
+        next: now,
+        produce: func(*tick) (osc.Message, bool) {
+            body := make([]byte, 4, 4+4*len(addrs))
+
+            for _, path := range addrs {
+                v, _, _ := s.store.Get(path)
+
+                switch v.Tag {
+                case 'f':
+                    body = binary.LittleEndian.AppendUint32(
+                        body, math.Float32bits(v.Float),
+                    )
+                case 's':
+                    str := make([]byte, 32)
+                    copy(str, v.Str)
+                    body = append(body, str...)
+                default:
+                    body = binary.LittleEndian.AppendUint32(
+                        body, uint32(v.Int),
+                    )
+                }
+            }
+
+            binary.LittleEndian.PutUint32(
+                body, uint32(len(body)),
+            )
+
+            return osc.NewMessage(alias, osc.Blob(body)), true
+        },
+    })
 }
+
